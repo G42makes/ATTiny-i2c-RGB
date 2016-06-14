@@ -1,0 +1,3 @@
+[submodule "TinyWire"]
+	path = TinyWire
+	url = https://github.com/rambo/TinyWire.git
