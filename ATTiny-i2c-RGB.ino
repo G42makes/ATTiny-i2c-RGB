@@ -12,21 +12,152 @@
 #define TWI_RX_BUFFER_SIZE ( 16 )
 #endif
 
+// In order to do software PWM using interrupts we need a bit of interesting code
+// References I used(and copied some code from):
+//  - http://jaywiggins.com/2011/05/04/attiny-software-pwm-to-drive-rgb-led/
+//      - used some of the structure of this code, plus it helped translate registers below
+//  - http://www.engblaze.com/microcontroller-tutorial-avr-and-arduino-timer-interrupts/  
+//      - this got it figured out for me, but some registers were different on the ATTiny
+//  - http://www.atmel.com/images/atmel-2586-avr-8-bit-microcontroller-attiny25-attiny45-attiny85_datasheet.pdf
+//      - I have read every word of this datasheet, I still don't understand it all, but it's a good reference
+//        to understand code that someone else has written that is very low level, like the above two
+//  - https://blog.blinkenlight.net/experiments/removing-flicker/glowing-bounce/
+//      - ended up not using the code from here, but some good ideas for fast software PWM
+//  - https://learn.sparkfun.com/tutorials/tiny-avr-programmer-hookup-guide/all
+//      - this thing saved me so much work figuring things out
+//
+// Create a few vars to hold counters used in the RGB PWM
+unsigned char compare[3];
+volatile unsigned char compbuff[3];
+
 //define the pins
+//  i2c DATA  0
 #define RED   1
-#define GREEN 3
-#define BLUE  4
+//  i2c CLOCK 2
+#define BLUE  3
+#define GREEN 4
 
 volatile uint8_t i2c_regs[] =
 {
-    0xFF,         //Red value
-    0x7F,         //Green value
-    0x00,         //Blue value
-    0x11,         //Unused, but I plan to eventually, gamma or mode
+    0x01,         // 0: Mode: 0=off, 1=solid, 2=fade
+    0x20,         // 1: Mode arguments(mode 0/1 = nothing, mode 2 = delay between changes)
+    0xAA,         // 2: Red value
+    0xFF,         // 3: Green value
+    0xFF,         // 4: Blue value
+    0x17,         // 5: Unused, currently just helps me ID the end when debugging reads
 };
 // Tracks the current register pointer position
-volatile byte reg_position;
+volatile byte reg_position = 0;
 const byte reg_size = sizeof(i2c_regs);
+
+void setup()
+{
+  // Disable global interrupts before initialization of the Timer
+  noInterrupts();   //cli();
+
+  //Set the RGB pins up
+  // Reminder: taking care of pull-ups is the masters job
+  pinMode(RED,   OUTPUT);
+  pinMode(GREEN, OUTPUT);
+  pinMode(BLUE,  OUTPUT);
+
+  // Setup as an i2c slave, the ports are fixed in the USI
+  //  Pin 7(PB2): SCL - clock
+  //  Pin 5(PB0): SDA - data
+  TinyWireS.begin(I2C_SLAVE_ADDRESS);
+  TinyWireS.onReceive(receiveEvent);
+  TinyWireS.onRequest(requestEvent);
+
+  //Set the LED to OFF to start, it will init to match the registers on first interrupt
+  digitalWrite(RED,   LOW); //Red
+  digitalWrite(GREEN, LOW); //Blue
+  digitalWrite(BLUE,  LOW); //Green
+
+  //Initialize Timer1
+  //  We use Timer1 because Timer0 is setup in the arduino libraries to run the millis() function
+  //  Below we set timer1 to call an ISR(interrupt service routine) whenever it overflows value.
+  //   This occurs every 256 timer ticks, because this is an 8 bit timer(see datasheet).
+  //   Every cpu cycle at 8MHz is 125ns, times 256 to overflow has us running the ISR every 32us, 
+  //    or 31.25KHz. We use 256 cycles of the ISR to do one PWM cycle, so the LEDs flicker around
+  //    every 8.2ms, or 122Hz, enough to keep your eyes fooled, but probably not for PoV use.
+  TCCR1 = 0;            // set entire TCCR1 register to 0, removes any existing values
+  TIMSK = (1 << TOIE1); // enable Timer1 overflow interrupt, calls ISR(TIMER1_OVF_vect) below
+  TCCR1 |= (1 << CS10); // Set CS10 bit so timer runs at the cpu clock speed
+
+  // Re-enable interrupts before we enter the main loop.
+  interrupts();
+}
+
+void loop()
+{
+  switch(i2c_regs[0]) {
+   case 0x00:
+    //all off
+    compbuff[0] = 0;
+    compbuff[1] = 0;
+    compbuff[2] = 0;
+    break;
+
+   case 0x01:
+    //all at set value
+    compbuff[0] = i2c_regs[2]; //Red
+    compbuff[1] = i2c_regs[3]; //Green
+    compbuff[2] = i2c_regs[4]; //Blue
+    break;
+
+   case 0x02:
+    //fade in
+    for(int i = 0; i < 256; i++ ) {
+      compbuff[0] = i2c_regs[2] * i / 256; //Red
+      compbuff[1] = i2c_regs[3] * i / 256; //Green
+      compbuff[2] = i2c_regs[4] * i / 256; //Blue
+      tws_delay(i2c_regs[1]);
+    }
+    //fade out
+    for(int i = 255; i >= 0; i-- ) {
+      compbuff[0] = i2c_regs[2] * i / 256; //Red
+      compbuff[1] = i2c_regs[3] * i / 256; //Green
+      compbuff[2] = i2c_regs[4] * i / 256; //Blue
+      tws_delay(i2c_regs[1]);
+    }
+
+  }
+    //From the TinyWireS code:
+    //  REMINDER: Do *not* use delay() anywhere, use tws_delay()
+    TinyWireS_stop_check();
+}
+
+/**
+ * Timer1 Overflow ISR
+ * This sets the RGB pins on/off in a cycle of 256, allowing us to set multiple brightness values
+ * 
+ */
+ISR(TIMER1_OVF_vect) {
+  static unsigned char softcount=0xFF;    //counts how many times we have been in the ISR, resets at 256 times
+
+  //a bit of a programming trick, we increment softcount inside the if statement
+  //doing the ++ before the var applies it before anything else is done, even the compare
+  //another trick is that the type of softcount will go from FF to 0 automatically here, due to overflow
+
+  // we break this into 3 sections 85 cycles apart(256/3) to help balance power usage between the LEDs
+  if(++softcount == 0) { 
+  
+    //These next three lines store the volatile values from compbuff into compate for internal use
+    // It's done outside a for loop or similar to save CPU cycles in this routine
+    compare[0] = compbuff[0];
+    compare[1] = compbuff[1];
+    compare[2] = compbuff[2];
+    //toggle the PortB pin0 to HIGH or LOW
+    //It would be faster to directly hit the pin, but I'm having issues with that breaking i2c
+    digitalWrite(RED,   HIGH); //Red
+    digitalWrite(GREEN, HIGH); //Blue
+    digitalWrite(BLUE,  HIGH); //Green
+  }
+  // clear port pin on compare match (executed on next interrupt)
+  if(compare[0] == softcount) digitalWrite(RED, LOW);
+  if(compare[1] == softcount) digitalWrite(GREEN, LOW);
+  if(compare[2] == softcount) digitalWrite(BLUE, LOW);
+}
 
 /**
  * This is called for each read request we receive, never put more than one byte of data (with TinyWireS.send) to the 
@@ -43,7 +174,7 @@ void requestEvent()
     }
 }
 /**
- * The I2C data received -handler
+ * The I2C data received handler
  *
  * This needs to complete before the next incoming transaction (start, data, restart/stop) on the bus does
  * so be quick, set flags for long running tasks to be called from the mainloop instead of running them directly,
@@ -80,42 +211,3 @@ void receiveEvent(uint8_t howMany)
 }
 
 
-void setup()
-{
-    // TODO: Tri-state this and wait for input voltage to stabilize 
-    //pinMode(3, OUTPUT); // OC1B-, Arduino pin 3, ADC
-    //digitalWrite(3, LOW); // Note that this makes the led turn on, it's wire this way to allow for the voltage sensing above.
-
-    //pinMode(1, OUTPUT); // OC1A, also The only HW-PWM -pin supported by the tiny core analogWrite
-    pinMode(RED, OUTPUT);
-    pinMode(GREEN, OUTPUT);
-    pinMode(BLUE, OUTPUT);
-
-    /**
-     * Reminder: taking care of pull-ups is the masters job
-     */
-
-    TinyWireS.begin(I2C_SLAVE_ADDRESS);
-    TinyWireS.onReceive(receiveEvent);
-    TinyWireS.onRequest(requestEvent);
-
-    
-    // Whatever other setup routines ?
-    
-    analogWrite(RED, 0); //Red
-    analogWrite(GREEN, 0); //Blue
-    analogWrite(BLUE, 0); //Green
-}
-
-void loop()
-{
-    analogWrite(RED, i2c_regs[0]); //Red
-    analogWrite(GREEN, i2c_regs[2]); //Blue
-    analogWrite(BLUE, i2c_regs[1]); //Green
-    /**
-     * This is the only way we can detect stop condition (http://www.avrfreaks.net/index.php?name=PNphpBB2&file=viewtopic&p=984716&sid=82e9dc7299a8243b86cf7969dd41b5b5#984716)
-     * it needs to be called in a very tight loop in order not to miss any (REMINDER: Do *not* use delay() anywhere, use tws_delay() instead).
-     * It will call the function registered via TinyWireS.onReceive(); if there is data in the buffer on stop.
-     */
-    TinyWireS_stop_check();
-}
