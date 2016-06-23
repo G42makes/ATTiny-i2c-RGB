@@ -5,12 +5,18 @@
 // https://github.com/rambo/TinyWire
 //  A lot is from the examples there - why re-invent the wheel?
 #define I2C_SLAVE_ADDRESS 0x52 // the 7-bit address: 'R' in ASCII - because RGB would not fit - //TODO: make this configurable if possible
-//#define I2C_SLAVE_ADDRESS 0x4
+
 #include "TinyWire/TinyWireS/TinyWireS.h"
 // The default buffer size, Can't recall the scope of defines right now
 #ifndef TWI_RX_BUFFER_SIZE
 #define TWI_RX_BUFFER_SIZE ( 16 )
 #endif
+
+//We want to remember the last state of our config, so we use the EEPROM library to store data between startups
+// Used the examples available in the Arduino IDE for the EEPROM segments
+#include <EEPROM.h>
+#define EEPROM_REVISION 0x0001  //used to version the data so we can change the array below and have it override whats in EEPROM
+#define EEPROM_OFFSET   0x00    //if we want to move the storage around, change this
 
 // In order to do software PWM using interrupts we need a bit of interesting code
 // References I used(and copied some code from):
@@ -44,7 +50,9 @@ volatile uint8_t i2c_regs[] =
     0xAA,         // 2: Red value
     0xFF,         // 3: Green value
     0xFF,         // 4: Blue value
-    0x17,         // 5: Unused, currently just helps me ID the end when debugging reads
+    0x17,         // 5: Should be 0x17 most of the time, changing it triggers special 
+                  //      actions and returns to 0x17(arbitrary choice - used to help see 
+                  //      the end of the options list before looping)
 };
 // Tracks the current register pointer position
 volatile byte reg_position = 0;
@@ -84,6 +92,17 @@ void setup()
   TIMSK = (1 << TOIE1); // enable Timer1 overflow interrupt, calls ISR(TIMER1_OVF_vect) below
   TCCR1 |= (1 << CS10); // Set CS10 bit so timer runs at the cpu clock speed
 
+  //Read the EEPROM values where appropriate
+  unsigned int ver;
+  EEPROM.get(EEPROM_OFFSET, ver);               //read version stored at the beginning of the EEPROM(w/ offset)
+  if ( ver == EEPROM_REVISION ) {
+    EEPROM.get(EEPROM_OFFSET + 2, i2c_regs);    //read the settings if the version has not changed
+                                                // offset by +2 to give room for REVISION
+  } else {
+    EEPROM.put(EEPROM_OFFSET, EEPROM_REVISION); //store the current version
+    EEPROM.put(EEPROM_OFFSET + 2, i2c_regs);    //and store the array as it currently exists in code
+  }
+
   // Re-enable interrupts before we enter the main loop.
   interrupts();
 }
@@ -122,6 +141,28 @@ void loop()
     }
 
   }
+
+  //Control Byte(last) can be used for other stuff
+  // Basically, write 0x57 to the last byte of regs and this should write settings to EEPROM
+  //  See README.md
+  switch(i2c_regs[sizeof(i2c_regs) - 1]) {
+    case 0x52:
+      //re-read eeprom
+      EEPROM.get(EEPROM_OFFSET + 2, i2c_regs);
+      i2c_regs[sizeof(i2c_regs) - 1] = 0x17;    //reset to default value
+      break;
+    case 0x57:
+      //write current regs to eeprom
+      EEPROM.put(EEPROM_OFFSET + 2, i2c_regs);
+      i2c_regs[sizeof(i2c_regs) - 1] = 0x17;    //reset to default value
+      break;
+
+    case 0x17:
+    default:
+      //if the magic number or non-used value, do nothing
+      break;
+  }
+  
     //From the TinyWireS code:
     //  REMINDER: Do *not* use delay() anywhere, use tws_delay()
     TinyWireS_stop_check();
@@ -209,5 +250,3 @@ void receiveEvent(uint8_t howMany)
         }
     }
 }
-
-
