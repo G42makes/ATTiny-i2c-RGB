@@ -37,15 +37,18 @@ unsigned char compare[3];
 volatile unsigned char compbuff[3];
 
 //define the pins
-//  i2c DATA  0
-#define RED   1
-//  i2c CLOCK 2
-#define BLUE  3
-#define GREEN 4
+//  i2c DATA  0     //Physical Pin 5
+#define RED   1     //Physical Pin 6
+//  i2c CLOCK 2     //Physical Pin 7
+#define BLUE  3     //Physical Pin 2
+#define GREEN 4     //Physical Pin 3
+//  power/V+        //Physical Pin 8
+//  ground/-        //Physical Pin 4
+//  reset           //Physical Pin 1
 
 volatile uint8_t i2c_regs[] =
 {
-    0x01,         // 0: Mode: 0=off, 1=solid, 2=fade
+    0x01,         // 0: Mode: 0=off, 1=solid, 2=fade, 3=rainbow loop
     0x20,         // 1: Mode arguments(mode 0/1 = nothing, mode 2 = delay between changes)
     0xAA,         // 2: Red value
     0xFF,         // 3: Green value
@@ -139,6 +142,38 @@ void loop()
       compbuff[2] = i2c_regs[4] * i / 256; //Blue
       tws_delay(i2c_regs[1]);
     }
+    break;
+   case 0x03:
+    //rotate colors, using RGB to set max intensity on those
+    // R-Y-G-C-B-M-R
+    //speed is still controlled by regs[1] value
+    compbuff[0] = i2c_regs[2];    //Set red full on
+    for(int i = 0; i < 256; i++ ) {
+      compbuff[1] = i2c_regs[3] * i / 256;  //fade in Green
+      tws_delay(i2c_regs[1]);
+    }
+    for(int i = 255; i >= 0; i-- ) {
+      compbuff[0] = i2c_regs[2] * i / 256;  //fade out Red
+      tws_delay(i2c_regs[1]);
+    }
+    for(int i = 0; i < 256; i++ ) {
+      compbuff[2] = i2c_regs[4] * i / 256;  //fade in Blue
+      tws_delay(i2c_regs[1]);
+    }
+    for(int i = 255; i >= 0; i-- ) {
+      compbuff[1] = i2c_regs[3] * i / 256;  //fade out Green
+      tws_delay(i2c_regs[1]);
+    }
+    for(int i = 0; i < 256; i++ ) {
+      compbuff[0] = i2c_regs[2] * i / 256;  //fade in Red
+      tws_delay(i2c_regs[1]);
+    }
+    for(int i = 255; i >= 0; i-- ) {
+      compbuff[2] = i2c_regs[4] * i / 256;  //fade out Blue
+      tws_delay(i2c_regs[1]);
+    }
+    //and we are back to Red full on    
+    break;
 
   }
 
@@ -190,9 +225,10 @@ ISR(TIMER1_OVF_vect) {
     compare[2] = compbuff[2];
     //toggle the PortB pin0 to HIGH or LOW
     //It would be faster to directly hit the pin, but I'm having issues with that breaking i2c
-    digitalWrite(RED,   HIGH); //Red
+    //digitalWrite(RED,   HIGH); //Red
     digitalWrite(GREEN, HIGH); //Blue
     digitalWrite(BLUE,  HIGH); //Green
+    digitalWrite(RED,   HIGH); //Red
   }
   // clear port pin on compare match (executed on next interrupt)
   if(compare[0] == softcount) digitalWrite(RED, LOW);
